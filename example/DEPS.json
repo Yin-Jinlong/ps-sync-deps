@@ -1,0 +1,18 @@
+{
+  "binaries": {
+    "antlr4-jar": {
+      "url": "https://www.antlr.org/download/antlr-4.13.2-complete.jar",
+      "version": "4.13.2"
+    }
+  },
+  "dependencies": {
+    "cli11": {
+      "url": "https://github.com/CLIUtils/CLI11.git",
+      "commit": "37bb6edc5317e99af72ef48405e65d9ca5218861"
+    },
+    "nlohmann_json": {
+      "url": "https://github.com/nlohmann/json.git",
+      "commit": "55f93686c01528224f448c19128836e7df245f72"
+    }
+  }
+}
