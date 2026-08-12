@@ -1,22 +1,26 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Sync git dependencies and binaries from a DEPS.json manifest.
+  Sync git / zip / 7z dependencies and binaries from a DEPS.json manifest.
 
 .DESCRIPTION
-  Reads a JSON file with "dependencies" (git url + commit) and optional
-  "binaries" (url + version), then clones/updates repos into SyncDir and
-  downloads binaries into BinDir.
+  Reads a JSON file with "dependencies" and optional "binaries", then syncs into
+  SyncDir / BinDir.
+
+  Dependency mode is chosen from the URL path suffix:
+    - *.zip  → download and extract zip into SyncDir
+    - *.7z   → download and extract 7z into SyncDir (requires 7-Zip)
+    - else   → git shallow clone + checkout (requires commit)
 
 .PARAMETER DepsFile
   Path to the dependency JSON file.
 
 .PARAMETER SyncDir
-  Directory where git dependencies are cloned (e.g. third_party).
+  Directory where dependencies are placed (e.g. third_party).
 
 .PARAMETER BinDir
-  Directory for binary downloads. Default: <SyncDir>/../bin relative to SyncDir's parent,
-  or alongside SyncDir as "bin" under the same parent. Explicitly set when needed.
+  Directory for binary downloads and archive cache.
+  Default: <SyncDir parent>/bin.
 
 .PARAMETER Name
   Optional list of dependency/binary names to sync. Omit to sync all.
@@ -99,6 +103,83 @@ function Remove-PathSafe {
     }
 }
 
+function Get-UrlLeaf {
+    param([string]$Url)
+    try {
+        $leaf = Split-Path -Leaf ([Uri]$Url).AbsolutePath
+        if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
+    } catch { }
+    return [string]$Url
+}
+
+function Get-DependencyMode {
+    param([string]$Url)
+    $leaf = (Get-UrlLeaf $Url).ToLowerInvariant()
+    if ($leaf.EndsWith('.7z')) { return '7z' }
+    if ($leaf.EndsWith('.zip')) { return 'zip' }
+    return 'git'
+}
+
+function Get-7zExe {
+    $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($candidate in @(
+            'C:\Program Files\7-Zip\7z.exe',
+            'C:\Program Files (x86)\7-Zip\7z.exe'
+        )) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
+}
+
+function Expand-DepArchive {
+    param(
+        [string]$ArchivePath,
+        [string]$DestDir,
+        [ValidateSet('zip', '7z')]
+        [string]$Format
+    )
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('ps-sync-deps-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    try {
+        if ($Format -eq '7z') {
+            $sevenZip = Get-7zExe
+            if (-not $sevenZip) {
+                throw '7-Zip not found (install 7-Zip or add 7z to PATH)'
+            }
+            & $sevenZip x -y ("-o" + $tmp) $ArchivePath | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "7z extraction failed (exit $LASTEXITCODE)"
+            }
+        } else {
+            Expand-Archive -LiteralPath $ArchivePath -DestinationPath $tmp -Force
+        }
+
+        $dirs = @(Get-ChildItem -LiteralPath $tmp -Directory)
+        $files = @(Get-ChildItem -LiteralPath $tmp -File)
+        $source = $tmp
+        if ($dirs.Count -eq 1 -and $files.Count -eq 0) {
+            $source = $dirs[0].FullName
+        }
+
+        $parent = Split-Path -Parent $DestDir
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        Remove-PathSafe $DestDir
+        if ($source -eq $tmp) {
+            New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+            Get-ChildItem -LiteralPath $tmp | Move-Item -Destination $DestDir
+        } else {
+            Move-Item -LiteralPath $source -Destination $DestDir
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Sync-CloneRepo {
     param(
         [string]$Name,
@@ -159,16 +240,26 @@ function Sync-UpdateRepo {
     }
 }
 
+function Get-ConfigString {
+    param(
+        [psobject]$Config,
+        [string]$Name
+    )
+    if ($null -eq $Config) { return '' }
+    if ($Config.PSObject.Properties.Name -notcontains $Name) { return '' }
+    return [string]$Config.$Name
+}
+
 function Sync-GitDependency {
     param(
         [string]$Name,
         [psobject]$Config,
         [string]$Root
     )
-    $url = [string]$Config.url
-    $commit = [string]$Config.commit
+    $url = Get-ConfigString $Config 'url'
+    $commit = Get-ConfigString $Config 'commit'
     if ([string]::IsNullOrWhiteSpace($url) -or [string]::IsNullOrWhiteSpace($commit)) {
-        throw "Dependency '$Name' requires url and commit"
+        throw "Dependency '$Name' (git) requires url and commit"
     }
 
     $targetPath = Join-Path $Root $Name
@@ -188,19 +279,100 @@ function Sync-GitDependency {
     Sync-UpdateRepo -Name $Name -Url $url -Commit $commit -TargetPath $targetPath
 }
 
+function Sync-ArchiveDependency {
+    param(
+        [string]$Name,
+        [psobject]$Config,
+        [string]$Root,
+        [string]$CacheDir,
+        [ValidateSet('zip', '7z')]
+        [string]$Format
+    )
+    $url = Get-ConfigString $Config 'url'
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        throw "Dependency '$Name' ($Format) requires url"
+    }
+
+    $extractTo = Get-ConfigString $Config 'extract_to'
+    if ([string]::IsNullOrWhiteSpace($extractTo)) {
+        $extractTo = $Name
+    }
+    $targetPath = Join-Path $Root $extractTo
+    $markerPath = Join-Path $targetPath '.ps_sync_deps_url'
+    $fileName = Get-UrlLeaf $url
+    $cachePath = Join-Path $CacheDir $fileName
+
+    Write-Log "`n=== Extracting $Name ($Format) ===" Cyan
+    Write-Log "URL: $url"
+    Write-Log "Target: $targetPath"
+
+    if ((Test-Path -LiteralPath $targetPath) -and (Test-Path -LiteralPath $markerPath)) {
+        $recorded = (Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8).Trim()
+        if ($recorded -eq $url) {
+            Write-Log 'Already extracted, skipping' Green
+            return
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $CacheDir)) {
+        New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $cachePath)) {
+        Write-Log "Downloading $url..."
+        Invoke-WebRequest -Uri $url -OutFile $cachePath -UseBasicParsing
+    } else {
+        Write-Log "Using cached archive: $cachePath"
+    }
+
+    Write-Log "Extracting $Format -> $targetPath..."
+    Expand-DepArchive -ArchivePath $cachePath -DestDir $targetPath -Format $Format
+    Set-Content -LiteralPath $markerPath -Value $url -Encoding UTF8 -NoNewline
+    Write-Log "Extracted $Name" Green
+}
+
+function Sync-Dependency {
+    param(
+        [string]$Name,
+        [psobject]$Config,
+        [string]$Root,
+        [string]$CacheDir
+    )
+    $url = Get-ConfigString $Config 'url'
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        throw "Dependency '$Name' requires url"
+    }
+
+    $mode = Get-DependencyMode $url
+    switch ($mode) {
+        'git' {
+            Sync-GitDependency -Name $Name -Config $Config -Root $Root
+        }
+        'zip' {
+            Sync-ArchiveDependency -Name $Name -Config $Config -Root $Root -CacheDir $CacheDir -Format zip
+        }
+        '7z' {
+            Sync-ArchiveDependency -Name $Name -Config $Config -Root $Root -CacheDir $CacheDir -Format 7z
+        }
+        default {
+            throw "Dependency '$Name': unknown mode '$mode'"
+        }
+    }
+}
+
 function Sync-BinaryFile {
     param(
         [string]$Name,
         [psobject]$Config,
         [string]$Root
     )
-    $url = [string]$Config.url
-    $version = [string]$Config.version
+    $url = Get-ConfigString $Config 'url'
+    $version = Get-ConfigString $Config 'version'
     if ([string]::IsNullOrWhiteSpace($url)) {
         throw "Binary '$Name' requires url"
     }
 
-    $fileName = Split-Path -Leaf ([Uri]$url).LocalPath
+    $fileName = Get-UrlLeaf $url
     if ([string]::IsNullOrWhiteSpace($fileName)) {
         $fileName = $Name
     }
@@ -254,6 +426,17 @@ function Get-NamedEntries {
     return $result
 }
 
+function Test-HasGitDependency {
+    param([System.Collections.IDictionary]$Dependencies)
+    foreach ($key in $Dependencies.Keys) {
+        $url = Get-ConfigString $Dependencies[$key] 'url'
+        if ((Get-DependencyMode $url) -eq 'git') {
+            return $true
+        }
+    }
+    return $false
+}
+
 # --- main ---
 
 $DepsFile = $PSCmdlet.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DepsFile)
@@ -270,20 +453,29 @@ if (-not (Test-Path -LiteralPath $DepsFile)) {
     exit 1
 }
 
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Log 'git is required but not found in PATH' Red
-    exit 1
-}
-
 $raw = Get-Content -LiteralPath $DepsFile -Raw -Encoding UTF8
 $deps = $raw | ConvertFrom-Json
 
-$binaries = Get-NamedEntries -Map $deps.binaries -Filter $Name
-$dependencies = Get-NamedEntries -Map $deps.dependencies -Filter $Name
+$binariesMap = $null
+$dependenciesMap = $null
+if ($deps.PSObject.Properties.Name -contains 'binaries') {
+    $binariesMap = $deps.binaries
+}
+if ($deps.PSObject.Properties.Name -contains 'dependencies') {
+    $dependenciesMap = $deps.dependencies
+}
+
+$binaries = Get-NamedEntries -Map $binariesMap -Filter $Name
+$dependencies = Get-NamedEntries -Map $dependenciesMap -Filter $Name
 
 if ($binaries.Count -eq 0 -and $dependencies.Count -eq 0) {
     Write-Log 'No dependencies to process' Yellow
     exit 0
+}
+
+if ((Test-HasGitDependency $dependencies) -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Log 'git is required for git dependencies but not found in PATH' Red
+    exit 1
 }
 
 Write-Log "`nDepsFile: $DepsFile" Cyan
@@ -295,11 +487,21 @@ Write-Log "Syncing $($dependencies.Count) dependencies..." Cyan
 if ($DryRun) {
     Write-Log '(dry run)' Yellow
     foreach ($key in $binaries.Keys) {
-        Write-Log ("`n  binary/{0}: {1}" -f $key, $binaries[$key].version)
+        Write-Log ("`n  binary/{0}: {1}" -f $key, (Get-ConfigString $binaries[$key] 'version'))
     }
     foreach ($key in $dependencies.Keys) {
-        $c = [string]$dependencies[$key].commit
-        Write-Log ("`n  {0}: {1}" -f $key, $c.Substring(0, [Math]::Min(8, $c.Length)))
+        $cfg = $dependencies[$key]
+        $url = Get-ConfigString $cfg 'url'
+        $mode = Get-DependencyMode $url
+        if ($mode -eq 'git') {
+            $c = Get-ConfigString $cfg 'commit'
+            $short = if ($c) { $c.Substring(0, [Math]::Min(8, $c.Length)) } else { '(missing commit)' }
+            Write-Log ("`n  {0} [git]: {1}" -f $key, $short)
+        } else {
+            $extractTo = Get-ConfigString $cfg 'extract_to'
+            if ([string]::IsNullOrWhiteSpace($extractTo)) { $extractTo = $key }
+            Write-Log ("`n  {0} [{1}]: extract_to={2}" -f $key, $mode, $extractTo)
+        }
     }
     exit 0
 }
@@ -307,7 +509,16 @@ if ($DryRun) {
 if (-not (Test-Path -LiteralPath $SyncDir)) {
     New-Item -ItemType Directory -Path $SyncDir -Force | Out-Null
 }
-if ($binaries.Count -gt 0 -and -not (Test-Path -LiteralPath $BinDir)) {
+$needBinDir = ($binaries.Count -gt 0)
+if (-not $needBinDir) {
+    foreach ($key in $dependencies.Keys) {
+        if ((Get-DependencyMode (Get-ConfigString $dependencies[$key] 'url')) -ne 'git') {
+            $needBinDir = $true
+            break
+        }
+    }
+}
+if ($needBinDir -and -not (Test-Path -LiteralPath $BinDir)) {
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 }
 
@@ -322,7 +533,7 @@ foreach ($key in $binaries.Keys) {
 
 foreach ($key in $dependencies.Keys) {
     try {
-        Sync-GitDependency -Name $key -Config $dependencies[$key] -Root $SyncDir
+        Sync-Dependency -Name $key -Config $dependencies[$key] -Root $SyncDir -CacheDir $BinDir
     } catch {
         Write-Log "Failed to sync ${key}: $($_.Exception.Message)" Red
         exit 1
