@@ -3,6 +3,12 @@
     "antlr4-jar": {
       "url": "https://www.antlr.org/download/antlr-4.13.2-complete.jar",
       "version": "4.13.2"
+    },
+    "ninja": {
+      "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+      "version": "1.13.2",
+      "extract": true,
+      "extract_to": "."
     }
   },
   "dependencies": {
@@ -13,10 +19,6 @@
     "nlohmann_json": {
       "url": "https://github.com/nlohmann/json.git",
       "commit": "55f93686c01528224f448c19128836e7df245f72"
-    },
-    "ffmpeg": {
-      "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-full_build-shared.7z",
-      "extract_to": "ffmpeg"
     }
   }
 }

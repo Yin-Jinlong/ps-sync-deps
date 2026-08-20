@@ -1,6 +1,6 @@
 # ps-sync-deps
 
-PowerShell 依赖同步工具：根据 `DEPS.json` 同步 git 仓库，或下载并解压 zip / 7z，并可选下载 binary。
+PowerShell 依赖同步工具：根据 `DEPS.json` 同步 git 仓库，或下载并解压 zip / 7z，并可选下载 / 解压 binary。
 
 ## 用法
 
@@ -36,6 +36,12 @@ PowerShell 依赖同步工具：根据 `DEPS.json` 同步 git 仓库，或下载
     "my-tool": {
       "url": "https://example.com/tool.jar",
       "version": "1.0.0"
+    },
+    "ninja": {
+      "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+      "version": "1.13.2",
+      "extract": true,
+      "extract_to": "."
     }
   },
   "dependencies": {
@@ -43,9 +49,9 @@ PowerShell 依赖同步工具：根据 `DEPS.json` 同步 git 仓库，或下载
       "url": "https://github.com/CLIUtils/CLI11.git",
       "commit": "37bb6edc5317e99af72ef48405e65d9ca5218861"
     },
-    "ffmpeg": {
-      "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-full_build-shared.7z",
-      "extract_to": "ffmpeg"
+    "zlib-src": {
+      "url": "https://example.com/zlib.zip",
+      "extract_to": "zlib"
     }
   }
 }
@@ -65,7 +71,9 @@ PowerShell 依赖同步工具：根据 `DEPS.json` 同步 git 仓库，或下载
 
 ### binaries
 
-下载到 `BinDir/<url 文件名>`；已存在则跳过。
+- 默认：下载到 `BinDir/<url 文件名>`；已存在则跳过
+- 压缩包版：设置 `"extract": true`（或填写 `extract_to`）时，按 URL 后缀解压 zip / 7z 到 `BinDir/<extract_to 或 name>`；压缩包缓存在 `BinDir`，已解压且 URL 未变则跳过
+- `extract` 需要 URL 以 `.zip` / `.7z` 结尾；顶层单目录剥除规则与 dependencies 相同
 
 示例见 [`example/DEPS.json`](example/DEPS.json)。
 

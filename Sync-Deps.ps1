@@ -12,6 +12,9 @@
     - *.7z   → download and extract 7z into SyncDir (requires 7-Zip)
     - else   → git shallow clone + checkout (requires commit)
 
+  Binaries download into BinDir by default. Set "extract": true (or extract_to)
+  for zip / 7z binary archives to extract into BinDir.
+
 .PARAMETER DepsFile
   Path to the dependency JSON file.
 
@@ -250,6 +253,28 @@ function Get-ConfigString {
     return [string]$Config.$Name
 }
 
+function Get-ConfigBool {
+    param(
+        [psobject]$Config,
+        [string]$Name
+    )
+    if ($null -eq $Config) { return $false }
+    if ($Config.PSObject.Properties.Name -notcontains $Name) { return $false }
+    $v = $Config.$Name
+    if ($v -is [bool]) { return $v }
+    if ($null -eq $v) { return $false }
+    $s = [string]$v
+    if ([string]::IsNullOrWhiteSpace($s)) { return $false }
+    return $s -eq '1' -or $s.Equals('true', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-BinaryExtract {
+    param([psobject]$Config)
+    if (Get-ConfigBool $Config 'extract') { return $true }
+    $extractTo = Get-ConfigString $Config 'extract_to'
+    return -not [string]::IsNullOrWhiteSpace($extractTo)
+}
+
 function Sync-GitDependency {
     param(
         [string]$Name,
@@ -372,6 +397,15 @@ function Sync-BinaryFile {
         throw "Binary '$Name' requires url"
     }
 
+    if (Test-BinaryExtract $Config) {
+        $mode = Get-DependencyMode $url
+        if ($mode -eq 'git') {
+            throw "Binary '$Name' extract requires a .zip or .7z url"
+        }
+        Sync-ArchiveDependency -Name $Name -Config $Config -Root $Root -CacheDir $Root -Format $mode
+        return
+    }
+
     $fileName = Get-UrlLeaf $url
     if ([string]::IsNullOrWhiteSpace($fileName)) {
         $fileName = $Name
@@ -487,7 +521,17 @@ Write-Log "Syncing $($dependencies.Count) dependencies..." Cyan
 if ($DryRun) {
     Write-Log '(dry run)' Yellow
     foreach ($key in $binaries.Keys) {
-        Write-Log ("`n  binary/{0}: {1}" -f $key, (Get-ConfigString $binaries[$key] 'version'))
+        $cfg = $binaries[$key]
+        $ver = Get-ConfigString $cfg 'version'
+        if (Test-BinaryExtract $cfg) {
+            $url = Get-ConfigString $cfg 'url'
+            $mode = Get-DependencyMode $url
+            $extractTo = Get-ConfigString $cfg 'extract_to'
+            if ([string]::IsNullOrWhiteSpace($extractTo)) { $extractTo = $key }
+            Write-Log ("`n  binary/{0}: {1} [extract {2} -> {3}]" -f $key, $ver, $mode, $extractTo)
+        } else {
+            Write-Log ("`n  binary/{0}: {1}" -f $key, $ver)
+        }
     }
     foreach ($key in $dependencies.Keys) {
         $cfg = $dependencies[$key]
